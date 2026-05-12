@@ -1,0 +1,15 @@
+services:
+  api-service:
+    build: .
+    container_name: api-service
+    restart: always
+    env_file:
+      - .env
+    ports:
+      - "3000:3000"
+    networks:
+      - smartfarm-network
+
+networks:
+  smartfarm-network:
+    external: true
