@@ -137,8 +137,13 @@ func main() {
 				allMessages = append(allMessages, sensorData)
 			}
 
-			// Devolvemos a mensagem para o InfluxConnector processar depois
-			ch.Nack(msg.DeliveryTag, false, true)
+			// Em vez de Nack imediato (que joga pro topo), 
+			// usei uma lógica de requeue que permite avançar.
+			// No RabbitMQ padrão, para "espiar" a fila toda, o ideal é 
+			// fechar o canal após coletar, mas o Nack(true) sempre 
+			// trará a mesma se o loop for síncrono.
+			defer ch.Nack(msg.DeliveryTag, false, true)
+			// log.Printf("Espiado mensagem da fila %s: %s", queueName, string(msg.Body))
 		}
 
 		return c.JSON(fiber.Map{
