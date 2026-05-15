@@ -11,6 +11,7 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/influxdata/influxdb-client-go/v2"
+	"github.com/redis/go-redis/v9"
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
@@ -28,6 +29,7 @@ func main() {
 	org := os.Getenv("INFLUX_ORG")
 	bucket := os.Getenv("INFLUX_BUCKET")
 	rabbitURL := os.Getenv("RABBIT_URL")
+	redisAddr := os.Getenv("REDIS_ADDR")
 
 	// Conector InfluxDB
 	client := influxdb2.NewClient(influxURL, token)
@@ -41,13 +43,25 @@ func main() {
 	}
 	defer rabbitConn.Close()
 
+	// Conector Redis
+	rdb := redis.NewClient(&redis.Options{
+		Addr: redisAddr,
+	})
+
+	// Testa conexão
+	_, err = rdb.Ping(context.Background()).Result()
+
+	if err != nil {
+		log.Fatal("Erro ao conectar no Redis:", err)
+	}
+
 	log.Println("Conexões estabelecidas com sucesso")
 
 	app := fiber.New()
 	app.Use(cors.New())
 
 	// 1. GET Histórico (InfluxDB)
-	app.Get("/api/sensors/:userID/:days/:deviceId", func(c *fiber.Ctx) error {
+	app.Get("/api/sensors/influx/:userID/:days/:deviceId", func(c *fiber.Ctx) error {
 		userID := c.Params("userID")
 		days := c.Params("days")
 		deviceId := c.Params("deviceId")
@@ -100,10 +114,11 @@ func main() {
 		return c.JSON(finalResponse)
 	})
 
-	// 2. GET todas as mensagens da respectiva fila (RabbitMQ - "Espiar" Fila)
+	// ISSO PEGA DIRETO DO BARRAMENTO DE EVENTOS (RabbitMQ)
+	// 2. GET todas as mensagens da respectiva fila (RabbitMQ - "Espiar" Fila) 
 	app.Get("/api/sensors/latest/:userID", func(c *fiber.Ctx) error {
 		userID := c.Params("userID")
-		queueName := fmt.Sprintf("fila_%s", userID)
+		queueName := fmt.Sprintf("sensor.%s.#", userID) // se não funcionar tenho que colocar o nome exato da fila (ex: sensor.fazenda1.12345) deviceType.userId.DeviceId
 
 		ch, err := rabbitConn.Channel()
 		if err != nil {
@@ -153,6 +168,66 @@ func main() {
 			"data":           allMessages,
 		})
 	})
+
+
+
+
+	// ISSO PEGA DO CACHE (REDIS)
+	app.Get("/api/sensors/latest/:userID/:deviceId", func(c *fiber.Ctx) error {
+		userID := c.Params("userID")
+		deviceId := c.Params("deviceId")
+		log.Printf("Recebendo requisição para userID: %s, deviceId: %s", userID, deviceId)
+
+		// Montamos a mesma chave que o Cache-Service usou
+		cacheKey := fmt.Sprintf("userId:%s:deviceId:%s:latest", userID, deviceId)
+
+		// Buscamos direto no Redis (Velocidade de memória RAM)
+		val, err := rdb.Get(context.Background(), cacheKey).Result()
+		if err != nil {
+			return c.Status(404).JSON(fiber.Map{
+				"error": "Dispositivo offline ou sem dados recentes no cache",
+			})
+		}
+
+		// Como salvamos o JSON inteiro no Redis, podemos retornar direto
+		// O Fiber SendString envia o conteúdo bruto sem re-encodar
+		c.Set("Content-Type", "application/json")
+		return c.SendString(val)
+	})
+
+
+	app.Get("/api/sensors/latest/:userID/all", func(c *fiber.Ctx) error {
+        userID := c.Params("userID")
+        
+        pattern := fmt.Sprintf("userId:%s:deviceId:*:latest", userID)
+
+        // CORREÇÃO: Usar c.Context() ou context.Background() em vez de 'context'
+        keys, err := rdb.Keys(c.Context(), pattern).Result() 
+        if err != nil {
+            return c.Status(500).JSON(fiber.Map{"error": "Erro ao buscar chaves no cache"})
+        }
+
+        if len(keys) == 0 {
+            return c.Status(404).JSON(fiber.Map{"message": "Nenhum sensor em cache para este usuário"})
+        }
+
+        var allData []interface{}
+        for _, key := range keys {
+            // CORREÇÃO: Usar c.Context() ou context.Background() aqui também
+            val, err := rdb.Get(c.Context(), key).Result() 
+            if err == nil {
+                var sensorMsg interface{}
+                json.Unmarshal([]byte(val), &sensorMsg)
+                allData = append(allData, sensorMsg)
+            }
+        }
+
+        return c.JSON(fiber.Map{
+            "status": "success",
+            "total":  len(allData),
+            "data":   allData,
+        })
+    })
 
 	log.Fatal(app.Listen(":3000"))
 }
