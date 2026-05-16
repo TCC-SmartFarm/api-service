@@ -6,6 +6,7 @@ import (
 	"log"
 	"encoding/json" 
 	"os"
+	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -114,120 +115,60 @@ func main() {
 		return c.JSON(finalResponse)
 	})
 
-	// ISSO PEGA DIRETO DO BARRAMENTO DE EVENTOS (RabbitMQ)
-	// 2. GET todas as mensagens da respectiva fila (RabbitMQ - "Espiar" Fila) 
-	app.Get("/api/sensors/latest/:userID", func(c *fiber.Ctx) error {
-		userID := c.Params("userID")
-		queueName := fmt.Sprintf("sensor.%s.#", userID) // se não funcionar tenho que colocar o nome exato da fila (ex: sensor.fazenda1.12345) deviceType.userId.DeviceId
-
-		ch, err := rabbitConn.Channel()
-		if err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": "Erro ao acessar barramento"})
-		}
-		defer ch.Close()
-
-		// Inspeciona a fila para saber o estado atual sem retirar nada
-		qInfo, err := ch.QueueInspect(queueName)
-		if err != nil {
-			return c.Status(404).JSON(fiber.Map{"error": "Fila não encontrada"})
-		}
-
-		var allMessages []SensorMessage
-		
-		// Definimos um limite para não travar a API caso a fila esteja gigante
-		limit := int(qInfo.Messages)
-		if limit > 50 {
-			limit = 50
-		}
-
-		// Loop controlado pela quantidade de mensagens existentes
-		for i := 0; i < limit; i++ {
-			msg, ok, err := ch.Get(queueName, false)
-			if err != nil || !ok {
-				break 
-			}
-
-			var sensorData SensorMessage
-			if err := json.Unmarshal(msg.Body, &sensorData); err == nil {
-				allMessages = append(allMessages, sensorData)
-			}
-
-			// Em vez de Nack imediato (que joga pro topo), 
-			// usei uma lógica de requeue que permite avançar.
-			// No RabbitMQ padrão, para "espiar" a fila toda, o ideal é 
-			// fechar o canal após coletar, mas o Nack(true) sempre 
-			// trará a mesma se o loop for síncrono.
-			defer ch.Nack(msg.DeliveryTag, false, true)
-			// log.Printf("Espiado mensagem da fila %s: %s", queueName, string(msg.Body))
-		}
-
-		return c.JSON(fiber.Map{
-			"status":         "success",
-			"messages_count": len(allMessages),
-			"queue_total":    qInfo.Messages,
-			"data":           allMessages,
-		})
-	})
-
-
-
-
 	// ISSO PEGA DO CACHE (REDIS)
 	app.Get("/api/sensors/latest/:userID/:deviceId", func(c *fiber.Ctx) error {
 		userID := c.Params("userID")
 		deviceId := c.Params("deviceId")
-		log.Printf("Recebendo requisição para userID: %s, deviceId: %s", userID, deviceId)
+		cacheKey := fmt.Sprintf("userId:%s:deviceId:%s:history", userID, deviceId)
 
-		// Montamos a mesma chave que o Cache-Service usou
-		cacheKey := fmt.Sprintf("userId:%s:deviceId:%s:latest", userID, deviceId)
-
-		// Buscamos direto no Redis (Velocidade de memória RAM)
-		val, err := rdb.Get(context.Background(), cacheKey).Result()
-		if err != nil {
-			return c.Status(404).JSON(fiber.Map{
-				"error": "Dispositivo offline ou sem dados recentes no cache",
-			})
+		// Pega todos os itens da lista (do 0 ao -1 significa "tudo")
+		vals, err := rdb.LRange(c.Context(), cacheKey, 0, -1).Result()
+		if err != nil || len(vals) == 0 {
+			return c.Status(404).JSON(fiber.Map{"error": "Sem dados no cache"})
 		}
 
-		// Como salvamos o JSON inteiro no Redis, podemos retornar direto
-		// O Fiber SendString envia o conteúdo bruto sem re-encodar
-		c.Set("Content-Type", "application/json")
-		return c.SendString(val)
+		// Como as strings no Redis já são JSONs, vamos montar um array de JSONs manualmente
+		// ou decodificar e enviar. O mais simples para o Fiber:
+		return c.SendString("[" + strings.Join(vals, ",") + "]")
 	})
 
 
-	app.Get("/api/sensors/latest/:userID/all", func(c *fiber.Ctx) error {
-        userID := c.Params("userID")
-        
-        pattern := fmt.Sprintf("userId:%s:deviceId:*:latest", userID)
+	app.Get("/api/sensors/all/:userID", func(c *fiber.Ctx) error {
+		userID := c.Params("userID")
+		
+		// 1. Padrão de busca para encontrar as listas de todos os dispositivos do usuário
+		// O Cache-Service agora salva como: userId:fazenda1:deviceId:XYZ:history
+		pattern := fmt.Sprintf("userId:%s:deviceId:*:history", userID)
 
-        // CORREÇÃO: Usar c.Context() ou context.Background() em vez de 'context'
-        keys, err := rdb.Keys(c.Context(), pattern).Result() 
-        if err != nil {
-            return c.Status(500).JSON(fiber.Map{"error": "Erro ao buscar chaves no cache"})
-        }
+		// 2. Localiza todas as chaves (dispositivos) que o usuário possui no cache
+		keys, err := rdb.Keys(c.Context(), pattern).Result()
+		if err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "Erro ao escanear dispositivos"})
+		}
 
-        if len(keys) == 0 {
-            return c.Status(404).JSON(fiber.Map{"message": "Nenhum sensor em cache para este usuário"})
-        }
+		if len(keys) == 0 {
+			return c.Status(404).JSON(fiber.Map{"message": "Nenhum sensor ativo encontrado"})
+		}
 
-        var allData []interface{}
-        for _, key := range keys {
-            // CORREÇÃO: Usar c.Context() ou context.Background() aqui também
-            val, err := rdb.Get(c.Context(), key).Result() 
-            if err == nil {
-                var sensorMsg interface{}
-                json.Unmarshal([]byte(val), &sensorMsg)
-                allData = append(allData, sensorMsg)
-            }
-        }
+		var statusGeral []interface{}
 
-        return c.JSON(fiber.Map{
-            "status": "success",
-            "total":  len(allData),
-            "data":   allData,
-        })
-    })
+		// 3. Para cada chave encontrada, pegamos apenas o PRIMEIRO item (índice 0)
+		// O LIndex(ctx, chave, 0) pega a leitura mais recente do buffer de 20
+		for _, key := range keys {
+			val, err := rdb.LIndex(c.Context(), key, 0).Result()
+			if err == nil {
+				var lastRead interface{}
+				json.Unmarshal([]byte(val), &lastRead)
+				statusGeral = append(statusGeral, lastRead)
+			}
+		}
+
+		return c.JSON(fiber.Map{
+			"usuario": userID,
+			"total_dispositivos": len(statusGeral),
+			"leituras": statusGeral,
+		})
+	})
 
 	log.Fatal(app.Listen(":3000"))
 }
