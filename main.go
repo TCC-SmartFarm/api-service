@@ -2,127 +2,26 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
-	"encoding/json" 
 	"os"
-	"time"
 	"strconv"
-	"strings"
+	"time"
 
-	"github.com/MicahParks/keyfunc/v3"
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/influxdata/influxdb-client-go/v2"
 	amqp "github.com/rabbitmq/amqp091-go"
+	"github.com/redis/go-redis/v9"
 )
 
-type SensorMessage struct { // para o payload do RabbitMQ
+// SensorMessage modela o payload publicado pelo mqtt-sub (e cacheado pelo cache-service).
+type SensorMessage struct {
 	UserId     string      `json:"userId"`
 	DeviceType string      `json:"deviceType"`
 	DeviceId   string      `json:"deviceId"`
-	Payload    interface{} `json:"payload"` // interface{} permite receber qualquer JSON interno
-}
-
-// Struct das claims do JWT.
-//
-// RegisteredClaims já inclui:
-// - sub (Subject / ID do usuário)
-// - iss (Issuer)
-// - aud (Audience)
-// - exp (Expiration)
-// - iat
-// - nbf
-type CustomClaims struct {
-	jwt.RegisteredClaims
-}
-
-func newJWKS(domain string) (keyfunc.Keyfunc, error) {
-
-	// Monta a URL do endpoint JWKS
-	url := fmt.Sprintf("https://%s/.well-known/jwks.json", domain)
-
-	// Cria o gerenciador automático de chaves
-	return keyfunc.NewDefault([]string{url})
-}
-
-func authMiddleware(
-	jwks keyfunc.Keyfunc,
-	audience string,
-	domain string,
-) fiber.Handler {
-
-	return func(c *fiber.Ctx) error {
-
-		authHeader := c.Get("Authorization")
-
-		if !strings.HasPrefix(authHeader, "Bearer ") {
-
-			return c.Status(fiber.StatusUnauthorized).JSON(
-				fiber.Map{
-					"error": "token ausente",
-				},
-			)
-		}
-
-		// Extrai token removendo "Bearer "
-
-		tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
-
-		// Faz parse e validação do JWT
-
-		token, err := jwt.ParseWithClaims(
-
-			// JWT recebido
-			tokenStr,
-
-			// Struct das claims
-			&CustomClaims{},
-
-			// Função que resolve as chaves públicas JWKS
-			jwks.Keyfunc,
-
-
-			// Validações adicionais
-
-			// Valida audience
-			jwt.WithAudience(audience),
-
-			// Valida issuer
-			jwt.WithIssuer(
-				fmt.Sprintf("https://%s/", domain),
-			),
-
-			// Exige claim de expiração
-			jwt.WithExpirationRequired(),
-
-			// Aceita apenas algoritmo RS256
-			// Muito importante para evitar ataques de troca de algoritmo.
-			jwt.WithValidMethods([]string{"RS256"}),
-		)
-
-		// Verifica validade do token
-
-		if err != nil || !token.Valid {
-
-			return c.Status(fiber.StatusUnauthorized).JSON(
-				fiber.Map{
-					"error": "token inválido ou expirado",
-				},
-			)
-		}
-
-		// Extrai claims
-
-		claims := token.Claims.(*CustomClaims)
-
-		// Salva ID do usuário autenticado no contexto
-		c.Locals("userID", claims.Subject)
-		// Continua
-
-		return c.Next()
-	}
+	Payload    interface{} `json:"payload"`
 }
 
 func main() {
@@ -135,6 +34,8 @@ func main() {
 	// Auth/JWT
 	authDomain := os.Getenv("AUTH_DOMAIN")
 	authAudience := os.Getenv("AUTH_AUDIENCE")
+	// Redis (cache populado pelo cache-service)
+	redisAddr := os.Getenv("REDIS_ADDR")
 
 
 	// Conector InfluxDB
@@ -148,6 +49,18 @@ func main() {
 		log.Fatal("Erro ao conectar no RabbitMQ:", err)
 	}
 	defer rabbitConn.Close()
+
+	// Conector Redis (lê o buffer circular mantido pelo cache-service)
+	rdb := redis.NewClient(&redis.Options{Addr: redisAddr})
+	if _, err := rdb.Ping(context.Background()).Result(); err != nil {
+		log.Fatal("Erro ao conectar no Redis:", err)
+	}
+
+	// JWKS do Auth0 (busca chaves públicas RS256 p/ validar o JWT)
+	jwks, err := newJWKS(authDomain)
+	if err != nil {
+		log.Fatal("Erro ao inicializar JWKS:", err)
+	}
 
 	log.Println("Conexões estabelecidas com sucesso")
 
@@ -237,57 +150,38 @@ func main() {
 		return c.JSON(finalResponse)
 	})
 
-	// 2. GET todas as mensagens da respectiva fila (RabbitMQ - "Espiar" Fila)
+	// 2. GET últimas leituras de todos os dispositivos do usuário (lê do cache Redis).
+	// O cache-service mantém um buffer circular de 20 leituras por device em chaves
+	// no padrão "userId:<sub>:deviceId:<deviceId>:history".
 	app.Get("/api/sensors/latest", func(c *fiber.Ctx) error {
 		userID := c.Locals("userID").(string)
 
-		queueName := fmt.Sprintf("fila_%s", userID)
-
-		ch, err := rabbitConn.Channel()
+		pattern := fmt.Sprintf("userId:%s:deviceId:*:history", userID)
+		keys, err := rdb.Keys(c.Context(), pattern).Result()
 		if err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": "Erro ao acessar barramento"})
+			return c.Status(500).JSON(fiber.Map{"error": "Erro ao buscar dados do cache"})
 		}
-		defer ch.Close()
 
-		// Inspeciona a fila para saber o estado atual sem retirar nada
-		qInfo, err := ch.QueueInspect(queueName)
-		if err != nil {
-			return c.Status(404).JSON(fiber.Map{"error": "Fila não encontrada"})
+		if len(keys) == 0 {
+			return c.Status(404).JSON(fiber.Map{"error": "Fila do usuário não encontrada"})
 		}
 
 		var allMessages []SensorMessage
-		
-		// Definimos um limite para não travar a API caso a fila esteja gigante
-		limit := int(qInfo.Messages)
-		if limit > 50 {
-			limit = 50
-		}
-
-		// Loop controlado pela quantidade de mensagens existentes
-		for i := 0; i < limit; i++ {
-			msg, ok, err := ch.Get(queueName, false)
-			if err != nil || !ok {
-				break 
+		for _, key := range keys {
+			val, err := rdb.LIndex(c.Context(), key, 0).Result()
+			if err != nil {
+				continue
 			}
-
 			var sensorData SensorMessage
-			if err := json.Unmarshal(msg.Body, &sensorData); err == nil {
+			if err := json.Unmarshal([]byte(val), &sensorData); err == nil {
 				allMessages = append(allMessages, sensorData)
 			}
-
-			// Em vez de Nack imediato (que joga pro topo), 
-			// usei uma lógica de requeue que permite avançar.
-			// No RabbitMQ padrão, para "espiar" a fila toda, o ideal é 
-			// fechar o canal após coletar, mas o Nack(true) sempre 
-			// trará a mesma se o loop for síncrono.
-			defer ch.Nack(msg.DeliveryTag, false, true)
-			// log.Printf("Espiado mensagem da fila %s: %s", queueName, string(msg.Body))
 		}
 
 		return c.JSON(fiber.Map{
 			"status":         "success",
 			"messages_count": len(allMessages),
-			"queue_total":    qInfo.Messages,
+			"queue_total":    len(allMessages),
 			"data":           allMessages,
 		})
 	})
