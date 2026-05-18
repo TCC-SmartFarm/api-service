@@ -31,6 +31,9 @@ func main() {
 	bucket := os.Getenv("INFLUX_BUCKET")
 	rabbitURL := os.Getenv("RABBIT_URL")
 	redisAddr := os.Getenv("REDIS_ADDR")
+	// Auth/JWT
+	authDomain := os.Getenv("AUTH_DOMAIN")
+	authAudience := os.Getenv("AUTH_AUDIENCE")
 
 	// Conector InfluxDB
 	client := influxdb2.NewClient(influxURL, token)
@@ -49,6 +52,12 @@ func main() {
 		Addr: redisAddr,
 	})
 
+	// JWKS do Auth0 (busca chaves públicas RS256 p/ validar o JWT)
+	jwks, err := newJWKS(authDomain)
+	if err != nil {
+		log.Fatal("Erro ao inicializar JWKS:", err)
+	}
+
 	// Testa conexão
 	_, err = rdb.Ping(context.Background()).Result()
 
@@ -61,9 +70,23 @@ func main() {
 	app := fiber.New()
 	app.Use(cors.New())
 
+	// Todas as rotas abaixo desse middleware exigirão autenticação JWT válida.
+	app.Use(
+		authMiddleware(
+			jwks,
+			authAudience,
+			authDomain,
+		),
+	)
+
+
 	// 1. GET Histórico (InfluxDB)
 	app.Get("/api/sensors/influx/:userID/:days/:deviceId", func(c *fiber.Ctx) error {
-		userID := c.Params("userID")
+		// userID := c.Params("userID")
+
+		// USER ID VINDO DO JWT
+		userID := c.Locals("userID").(string)
+		
 		days := c.Params("days")
 		deviceId := c.Params("deviceId")
 
@@ -117,7 +140,11 @@ func main() {
 
 	// ISSO PEGA DO CACHE (REDIS)
 	app.Get("/api/sensors/latest/:userID/:deviceId", func(c *fiber.Ctx) error {
-		userID := c.Params("userID")
+		// userID := c.Params("userID")
+
+		// USER ID VINDO DO JWT
+		userID := c.Locals("userID").(string)
+
 		deviceId := c.Params("deviceId")
 		cacheKey := fmt.Sprintf("userId:%s:deviceId:%s:history", userID, deviceId)
 
@@ -134,7 +161,10 @@ func main() {
 
 
 	app.Get("/api/sensors/all/:userID", func(c *fiber.Ctx) error {
-		userID := c.Params("userID")
+		// userID := c.Params("userID")
+
+		// USER ID VINDO DO JWT
+		userID := c.Locals("userID").(string)
 		
 		// 1. Padrão de busca para encontrar as listas de todos os dispositivos do usuário
 		// O Cache-Service agora salva como: userId:fazenda1:deviceId:XYZ:history
