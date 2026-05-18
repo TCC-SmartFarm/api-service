@@ -20,6 +20,7 @@ type SensorMessage struct { // para o payload do RabbitMQ
 	UserId     string      `json:"userId"`
 	DeviceType string      `json:"deviceType"`
 	DeviceId   string      `json:"deviceId"`
+	Name	   string      `json:"name"`
 	Payload    interface{} `json:"payload"` // interface{} permite receber qualquer JSON interno
 }
 
@@ -31,9 +32,7 @@ func main() {
 	bucket := os.Getenv("INFLUX_BUCKET")
 	rabbitURL := os.Getenv("RABBIT_URL")
 	redisAddr := os.Getenv("REDIS_ADDR")
-	// Auth/JWT
-	authDomain := os.Getenv("AUTH_DOMAIN")
-	authAudience := os.Getenv("AUTH_AUDIENCE")
+
 
 	// Conector InfluxDB
 	client := influxdb2.NewClient(influxURL, token)
@@ -52,12 +51,6 @@ func main() {
 		Addr: redisAddr,
 	})
 
-	// JWKS do Auth0 (busca chaves públicas RS256 p/ validar o JWT)
-	jwks, err := newJWKS(authDomain)
-	if err != nil {
-		log.Fatal("Erro ao inicializar JWKS:", err)
-	}
-
 	// Testa conexão
 	_, err = rdb.Ping(context.Background()).Result()
 
@@ -70,23 +63,10 @@ func main() {
 	app := fiber.New()
 	app.Use(cors.New())
 
-	// Todas as rotas abaixo desse middleware exigirão autenticação JWT válida.
-	app.Use(
-		authMiddleware(
-			jwks,
-			authAudience,
-			authDomain,
-		),
-	)
-
 
 	// 1. GET Histórico (InfluxDB)
 	app.Get("/api/sensors/influx/:userID/:days/:deviceId", func(c *fiber.Ctx) error {
-		// userID := c.Params("userID")
-
-		// USER ID VINDO DO JWT
-		userID := c.Locals("userID").(string)
-		
+		userID := c.Params("userID")
 		days := c.Params("days")
 		deviceId := c.Params("deviceId")
 
@@ -96,7 +76,7 @@ func main() {
         |> filter(fn: (r) => r["_measurement"] == "telemetria")
         |> filter(fn: (r) => r["userId"] == "%s")
         |> filter(fn: (r) => r["deviceId"] == "%s")
-        |> filter(fn: (r) => r["_field"] == "temperatura" or r["_field"] == "umidade" or r["_field"] == "ph")
+        |> filter(fn: (r) => r["_field"] == "soil_temperature" or r["_field"] == "soil_moisture" or r["_field"] == "air_humidity" or r["_field"] == "luminosity" or r["_field"] == "air_temperature" or r["_field"] == "battery" or r["_field"] == "latitude" or r["_field"] == "longitude")
         |> map(fn: (r) => ({ r with _value: float(v: r._value) }))`, bucket, days, userID, deviceId)
 
 		result, err := queryAPI.Query(context.Background(), query)
@@ -120,6 +100,7 @@ func main() {
 					"userId":     record.ValueByKey("userId"),
 					"deviceId":   record.ValueByKey("deviceId"),
 					"deviceType": record.ValueByKey("deviceType"),
+					"name":       record.ValueByKey("name"),
 					"value":    make(map[string]interface{}),
 				}
 			}
@@ -140,11 +121,7 @@ func main() {
 
 	// ISSO PEGA DO CACHE (REDIS)
 	app.Get("/api/sensors/latest/:userID/:deviceId", func(c *fiber.Ctx) error {
-		// userID := c.Params("userID")
-
-		// USER ID VINDO DO JWT
-		userID := c.Locals("userID").(string)
-
+		userID := c.Params("userID")
 		deviceId := c.Params("deviceId")
 		cacheKey := fmt.Sprintf("userId:%s:deviceId:%s:history", userID, deviceId)
 
@@ -161,10 +138,7 @@ func main() {
 
 
 	app.Get("/api/sensors/all/:userID", func(c *fiber.Ctx) error {
-		// userID := c.Params("userID")
-
-		// USER ID VINDO DO JWT
-		userID := c.Locals("userID").(string)
+		userID := c.Params("userID")
 		
 		// 1. Padrão de busca para encontrar as listas de todos os dispositivos do usuário
 		// O Cache-Service agora salva como: userId:fazenda1:deviceId:XYZ:history
