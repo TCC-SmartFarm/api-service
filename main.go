@@ -2,26 +2,26 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
+	"encoding/json" 
 	"os"
-	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/influxdata/influxdb-client-go/v2"
-	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/redis/go-redis/v9"
+	amqp "github.com/rabbitmq/amqp091-go"
 )
 
-// SensorMessage modela o payload publicado pelo mqtt-sub (e cacheado pelo cache-service).
-type SensorMessage struct {
+type SensorMessage struct { // para o payload do RabbitMQ
 	UserId     string      `json:"userId"`
 	DeviceType string      `json:"deviceType"`
 	DeviceId   string      `json:"deviceId"`
-	Payload    interface{} `json:"payload"`
+	Name	   string      `json:"name"`
+	Payload    interface{} `json:"payload"` // interface{} permite receber qualquer JSON interno
 }
 
 func main() {
@@ -31,10 +31,6 @@ func main() {
 	org := os.Getenv("INFLUX_ORG")
 	bucket := os.Getenv("INFLUX_BUCKET")
 	rabbitURL := os.Getenv("RABBIT_URL")
-	// Auth/JWT
-	authDomain := os.Getenv("AUTH_DOMAIN")
-	authAudience := os.Getenv("AUTH_AUDIENCE")
-	// Redis (cache populado pelo cache-service)
 	redisAddr := os.Getenv("REDIS_ADDR")
 
 
@@ -50,16 +46,16 @@ func main() {
 	}
 	defer rabbitConn.Close()
 
-	// Conector Redis (lê o buffer circular mantido pelo cache-service)
-	rdb := redis.NewClient(&redis.Options{Addr: redisAddr})
-	if _, err := rdb.Ping(context.Background()).Result(); err != nil {
-		log.Fatal("Erro ao conectar no Redis:", err)
-	}
+	// Conector Redis
+	rdb := redis.NewClient(&redis.Options{
+		Addr: redisAddr,
+	})
 
-	// JWKS do Auth0 (busca chaves públicas RS256 p/ validar o JWT)
-	jwks, err := newJWKS(authDomain)
+	// Testa conexão
+	_, err = rdb.Ping(context.Background()).Result()
+
 	if err != nil {
-		log.Fatal("Erro ao inicializar JWKS:", err)
+		log.Fatal("Erro ao conectar no Redis:", err)
 	}
 
 	log.Println("Conexões estabelecidas com sucesso")
@@ -67,48 +63,20 @@ func main() {
 	app := fiber.New()
 	app.Use(cors.New())
 
-	// Todas as rotas abaixo desse middleware exigirão autenticação JWT válida.
-	app.Use(
-		authMiddleware(
-			jwks,
-			authAudience,
-			authDomain,
-		),
-	)
 
 	// 1. GET Histórico (InfluxDB)
-	// Removemos ":userID" da URL. Agora o usuário vem do JWT autenticado.
-	// Isso impede acesso a dados de outros usuários.
-	app.Get("/api/sensors/:days/:deviceId", func(c *fiber.Ctx) error {
-
-		// USER ID VINDO DO JWT
-
-		userID := c.Locals("userID").(string)
-
-		// PARAMS
-
+	app.Get("/api/sensors/influx/:userID/:days/:deviceId", func(c *fiber.Ctx) error {
+		userID := c.Params("userID")
 		days := c.Params("days")
 		deviceId := c.Params("deviceId")
 
-		// VALIDAÇÃO DE INPUT
-
-		// Evita injection e inputs inválidos
-		if _, err := strconv.Atoi(days); err != nil {
-
-			return c.Status(400).JSON(
-				fiber.Map{
-					"error": "days inválido",
-				},
-			)
-		}
- 
 		// Query corrigida: converte para float para evitar erro de agregação com strings
 		query := fmt.Sprintf(`from(bucket: "%s")
         |> range(start: -%sd)
         |> filter(fn: (r) => r["_measurement"] == "telemetria")
         |> filter(fn: (r) => r["userId"] == "%s")
         |> filter(fn: (r) => r["deviceId"] == "%s")
-        |> filter(fn: (r) => r["_field"] == "temperatura" or r["_field"] == "umidade" or r["_field"] == "ph")
+        |> filter(fn: (r) => r["_field"] == "soil_temperature" or r["_field"] == "soil_moisture" or r["_field"] == "air_humidity" or r["_field"] == "luminosity" or r["_field"] == "air_temperature" or r["_field"] == "battery" or r["_field"] == "latitude" or r["_field"] == "longitude")
         |> map(fn: (r) => ({ r with _value: float(v: r._value) }))`, bucket, days, userID, deviceId)
 
 		result, err := queryAPI.Query(context.Background(), query)
@@ -132,6 +100,7 @@ func main() {
 					"userId":     record.ValueByKey("userId"),
 					"deviceId":   record.ValueByKey("deviceId"),
 					"deviceType": record.ValueByKey("deviceType"),
+					"name":       record.ValueByKey("name"),
 					"value":    make(map[string]interface{}),
 				}
 			}
@@ -150,39 +119,58 @@ func main() {
 		return c.JSON(finalResponse)
 	})
 
-	// 2. GET últimas leituras de todos os dispositivos do usuário (lê do cache Redis).
-	// O cache-service mantém um buffer circular de 20 leituras por device em chaves
-	// no padrão "userId:<sub>:deviceId:<deviceId>:history".
-	app.Get("/api/sensors/latest", func(c *fiber.Ctx) error {
-		userID := c.Locals("userID").(string)
+	// ISSO PEGA DO CACHE (REDIS)
+	app.Get("/api/sensors/latest/:userID/:deviceId", func(c *fiber.Ctx) error {
+		userID := c.Params("userID")
+		deviceId := c.Params("deviceId")
+		cacheKey := fmt.Sprintf("userId:%s:deviceId:%s:history", userID, deviceId)
 
+		// Pega todos os itens da lista (do 0 ao -1 significa "tudo")
+		vals, err := rdb.LRange(c.Context(), cacheKey, 0, -1).Result()
+		if err != nil || len(vals) == 0 {
+			return c.Status(404).JSON(fiber.Map{"error": "Sem dados no cache"})
+		}
+
+		// Como as strings no Redis já são JSONs, vamos montar um array de JSONs manualmente
+		// ou decodificar e enviar. O mais simples para o Fiber:
+		return c.SendString("[" + strings.Join(vals, ",") + "]")
+	})
+
+
+	app.Get("/api/sensors/all/:userID", func(c *fiber.Ctx) error {
+		userID := c.Params("userID")
+		
+		// 1. Padrão de busca para encontrar as listas de todos os dispositivos do usuário
+		// O Cache-Service agora salva como: userId:fazenda1:deviceId:XYZ:history
 		pattern := fmt.Sprintf("userId:%s:deviceId:*:history", userID)
+
+		// 2. Localiza todas as chaves (dispositivos) que o usuário possui no cache
 		keys, err := rdb.Keys(c.Context(), pattern).Result()
 		if err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": "Erro ao buscar dados do cache"})
+			return c.Status(500).JSON(fiber.Map{"error": "Erro ao escanear dispositivos"})
 		}
 
 		if len(keys) == 0 {
-			return c.Status(404).JSON(fiber.Map{"error": "Fila do usuário não encontrada"})
+			return c.Status(404).JSON(fiber.Map{"message": "Nenhum sensor ativo encontrado"})
 		}
 
-		var allMessages []SensorMessage
+		var statusGeral []interface{}
+
+		// 3. Para cada chave encontrada, pegamos apenas o PRIMEIRO item (índice 0)
+		// O LIndex(ctx, chave, 0) pega a leitura mais recente do buffer de 20
 		for _, key := range keys {
 			val, err := rdb.LIndex(c.Context(), key, 0).Result()
-			if err != nil {
-				continue
-			}
-			var sensorData SensorMessage
-			if err := json.Unmarshal([]byte(val), &sensorData); err == nil {
-				allMessages = append(allMessages, sensorData)
+			if err == nil {
+				var lastRead interface{}
+				json.Unmarshal([]byte(val), &lastRead)
+				statusGeral = append(statusGeral, lastRead)
 			}
 		}
 
 		return c.JSON(fiber.Map{
-			"status":         "success",
-			"messages_count": len(allMessages),
-			"queue_total":    len(allMessages),
-			"data":           allMessages,
+			"usuario": userID,
+			"total_dispositivos": len(statusGeral),
+			"leituras": statusGeral,
 		})
 	})
 
