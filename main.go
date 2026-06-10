@@ -2,25 +2,32 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
-	"encoding/json" 
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/MicahParks/keyfunc/v3"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/influxdata/influxdb-client-go/v2"
-	"github.com/redis/go-redis/v9"
 	amqp "github.com/rabbitmq/amqp091-go"
+	"github.com/redis/go-redis/v9"
 )
+
+// deviceIdPattern valida o :deviceId da URL antes de interpolá-lo nas queries
+// do Influx e nas chaves do Redis.
+var deviceIdPattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
 type SensorMessage struct { // para o payload do RabbitMQ
 	UserId     string      `json:"userId"`
 	DeviceType string      `json:"deviceType"`
 	DeviceId   string      `json:"deviceId"`
-	Name	   string      `json:"name"`
+	Name       string      `json:"name"`
 	Payload    interface{} `json:"payload"` // interface{} permite receber qualquer JSON interno
 }
 
@@ -32,7 +39,12 @@ func main() {
 	bucket := os.Getenv("INFLUX_BUCKET")
 	rabbitURL := os.Getenv("RABBIT_URL")
 	redisAddr := os.Getenv("REDIS_ADDR")
+	authDomain := os.Getenv("AUTH_DOMAIN")
+	authAudience := os.Getenv("AUTH_AUDIENCE")
 
+	if authDomain == "" || authAudience == "" {
+		log.Fatal("AUTH_DOMAIN e AUTH_AUDIENCE são obrigatórios")
+	}
 
 	// Conector InfluxDB
 	client := influxdb2.NewClient(influxURL, token)
@@ -58,17 +70,54 @@ func main() {
 		log.Fatal("Erro ao conectar no Redis:", err)
 	}
 
+	// Chaves públicas do Auth0 para validar os JWTs. Retry no boot porque o
+	// container pode subir antes da rede/DNS estarem prontos.
+	var jwks keyfunc.Keyfunc
+	for attempt := 1; ; attempt++ {
+		jwks, err = newJWKS(authDomain)
+		if err == nil {
+			break
+		}
+		if attempt >= 3 {
+			log.Fatal("Erro ao inicializar JWKS:", err)
+		}
+		log.Printf("JWKS tentativa %d falhou (%v), tentando de novo...", attempt, err)
+		time.Sleep(time.Duration(attempt) * 5 * time.Second)
+	}
+
 	log.Println("Conexões estabelecidas com sucesso")
 
 	app := fiber.New()
-	app.Use(cors.New())
 
+	// CORS precisa vir ANTES do auth: o preflight OPTIONS do browser não
+	// carrega o header Authorization.
+	app.Use(cors.New(cors.Config{
+		AllowOrigins: "*",
+		AllowMethods: "GET,OPTIONS",
+		AllowHeaders: "Origin, Content-Type, Accept, Authorization",
+	}))
+
+	// Healthcheck sem autenticação (monitoramento e smoke tests).
+	app.Get("/health", func(c *fiber.Ctx) error {
+		return c.JSON(fiber.Map{"status": "ok"})
+	})
+
+	// Todas as rotas registradas a partir daqui exigem JWT válido do Auth0.
+	// Nos handlers, use GetAuthUser(c) para obter o usuário autenticado.
+	app.Use(authMiddleware(jwks, authAudience, authDomain))
 
 	// 1. GET Histórico (InfluxDB)
-	app.Get("/api/sensors/influx/:userID/:days/:deviceId", func(c *fiber.Ctx) error {
-		userID := c.Params("userID")
+	app.Get("/api/sensors/influx/:days/:deviceId", func(c *fiber.Ctx) error {
+		user := GetAuthUser(c)
 		days := c.Params("days")
 		deviceId := c.Params("deviceId")
+
+		if _, err := strconv.Atoi(days); err != nil {
+			return c.Status(400).JSON(fiber.Map{"error": "days deve ser um número inteiro"})
+		}
+		if !deviceIdPattern.MatchString(deviceId) {
+			return c.Status(400).JSON(fiber.Map{"error": "deviceId inválido"})
+		}
 
 		// Query corrigida: converte para float para evitar erro de agregação com strings
 		query := fmt.Sprintf(`from(bucket: "%s")
@@ -77,7 +126,7 @@ func main() {
         |> filter(fn: (r) => r["userId"] == "%s")
         |> filter(fn: (r) => r["deviceId"] == "%s")
         |> filter(fn: (r) => r["_field"] == "soil_temperature" or r["_field"] == "soil_moisture" or r["_field"] == "air_humidity" or r["_field"] == "luminosity" or r["_field"] == "air_temperature" or r["_field"] == "battery" or r["_field"] == "latitude" or r["_field"] == "longitude")
-        |> map(fn: (r) => ({ r with _value: float(v: r._value) }))`, bucket, days, userID, deviceId)
+        |> map(fn: (r) => ({ r with _value: float(v: r._value) }))`, bucket, days, user.UserID, deviceId)
 
 		result, err := queryAPI.Query(context.Background(), query)
 		if err != nil {
@@ -101,7 +150,7 @@ func main() {
 					"deviceId":   record.ValueByKey("deviceId"),
 					"deviceType": record.ValueByKey("deviceType"),
 					"name":       record.ValueByKey("name"),
-					"value":    make(map[string]interface{}),
+					"value":      make(map[string]interface{}),
 				}
 			}
 
@@ -120,10 +169,15 @@ func main() {
 	})
 
 	// ISSO PEGA DO CACHE (REDIS)
-	app.Get("/api/sensors/latest/:userID/:deviceId", func(c *fiber.Ctx) error {
-		userID := c.Params("userID")
+	app.Get("/api/sensors/latest/:deviceId", func(c *fiber.Ctx) error {
+		user := GetAuthUser(c)
 		deviceId := c.Params("deviceId")
-		cacheKey := fmt.Sprintf("userId:%s:deviceId:%s:history", userID, deviceId)
+
+		if !deviceIdPattern.MatchString(deviceId) {
+			return c.Status(400).JSON(fiber.Map{"error": "deviceId inválido"})
+		}
+
+		cacheKey := fmt.Sprintf("userId:%s:deviceId:%s:history", user.UserID, deviceId)
 
 		// Pega todos os itens da lista (do 0 ao -1 significa "tudo")
 		vals, err := rdb.LRange(c.Context(), cacheKey, 0, -1).Result()
@@ -136,13 +190,12 @@ func main() {
 		return c.SendString("[" + strings.Join(vals, ",") + "]")
 	})
 
+	app.Get("/api/sensors/all", func(c *fiber.Ctx) error {
+		user := GetAuthUser(c)
 
-	app.Get("/api/sensors/all/:userID", func(c *fiber.Ctx) error {
-		userID := c.Params("userID")
-		
 		// 1. Padrão de busca para encontrar as listas de todos os dispositivos do usuário
 		// O Cache-Service agora salva como: userId:fazenda1:deviceId:XYZ:history
-		pattern := fmt.Sprintf("userId:%s:deviceId:*:history", userID)
+		pattern := fmt.Sprintf("userId:%s:deviceId:*:history", user.UserID)
 
 		// 2. Localiza todas as chaves (dispositivos) que o usuário possui no cache
 		keys, err := rdb.Keys(c.Context(), pattern).Result()
@@ -168,9 +221,9 @@ func main() {
 		}
 
 		return c.JSON(fiber.Map{
-			"usuario": userID,
+			"usuario":            user.UserID,
 			"total_dispositivos": len(statusGeral),
-			"leituras": statusGeral,
+			"leituras":           statusGeral,
 		})
 	})
 

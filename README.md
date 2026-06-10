@@ -1,16 +1,17 @@
 # REST API (Go + Fiber)
 
 ### Descrição
+
 Este microserviço atua como a interface de comunicação entre o **Front-end (React)** e a camada de persistência temporal (**InfluxDB Cloud**). Ele fornece endpoints seguros para a recuperação de séries temporais e estados atuais dos sensores.
 
 ### Bibliotecas
+
 - **Fiber (gofiber/fiber)**: Framework web focado em performance extrema e baixo consumo de recursos.
 - **InfluxDB Client Go**: Para execução de queries complexas e agregações de dados no tempo.
 
 ### Justificativa (ODS 9)
+
 O uso de uma API desacoplada garante que o sistema de visualização possa evoluir independentemente da camada de sensores. A escolha do Go permite que a API responda com latência mínima, crucial para o monitoramento em tempo real de ativos agrícolas críticos.
-
-
 
 ### Endpoints Principais
 
