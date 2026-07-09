@@ -17,10 +17,10 @@ import (
 )
 
 type SensorMessage struct { // para o payload do RabbitMQ
-	UserId     string      `json:"userId"`
+	ApplicationId     string      `json:"applicationId"`
 	DeviceType string      `json:"deviceType"`
-	DeviceId   string      `json:"deviceId"`
-	Name	   string      `json:"name"`
+	DevAddr   string      `json:"devAddr"`
+	DevEUI	   string      `json:"devEUI"`
 	Payload    interface{} `json:"payload"` // interface{} permite receber qualquer JSON interno
 }
 
@@ -65,19 +65,19 @@ func main() {
 
 
 	// 1. GET Histórico (InfluxDB)
-	app.Get("/api/sensors/influx/:userID/:days/:deviceId", func(c *fiber.Ctx) error {
-		userID := c.Params("userID")
+	app.Get("/api/sensors/influx/:applicationId/:days/:devAddr", func(c *fiber.Ctx) error {
+		applicationId := c.Params("applicationId")
 		days := c.Params("days")
-		deviceId := c.Params("deviceId")
+		devAddr := c.Params("devAddr")
 
 		// Query corrigida: converte para float para evitar erro de agregação com strings
 		query := fmt.Sprintf(`from(bucket: "%s")
         |> range(start: -%sd)
         |> filter(fn: (r) => r["_measurement"] == "telemetria")
-        |> filter(fn: (r) => r["userId"] == "%s")
-        |> filter(fn: (r) => r["deviceId"] == "%s")
-        |> filter(fn: (r) => r["_field"] == "soil_temperature" or r["_field"] == "soil_moisture" or r["_field"] == "air_humidity" or r["_field"] == "luminosity" or r["_field"] == "air_temperature" or r["_field"] == "battery" or r["_field"] == "latitude" or r["_field"] == "longitude")
-        |> map(fn: (r) => ({ r with _value: float(v: r._value) }))`, bucket, days, userID, deviceId)
+        |> filter(fn: (r) => r["applicationId"] == "%s")
+        |> filter(fn: (r) => r["devAddr"] == "%s")
+        |> filter(fn: (r) => r["_field"] == "soil_temperature" or r["_field"] == "soil_moisture" or r["_field"] == "air_humidity" or r["_field"] == "luminosity" or r["_field"] == "air_temperature" or r["_field"] == "battery" or r["_field"] == "latitude" or r["_field"] == "longitude" or r["_field"] == "validity")
+        |> map(fn: (r) => ({ r with _value: float(v: r._value) }))`, bucket, days, applicationId, devAddr)
 
 		result, err := queryAPI.Query(context.Background(), query)
 		if err != nil {
@@ -97,10 +97,10 @@ func main() {
 			if _, ok := groupedData[t]; !ok {
 				groupedData[t] = fiber.Map{
 					"timestamp":  record.Time().Unix(), // Exibe o timestamp como inteiro (Unix) para facilitar o uso no frontend
-					"userId":     record.ValueByKey("userId"),
-					"deviceId":   record.ValueByKey("deviceId"),
+					"applicationId":     record.ValueByKey("applicationId"),
+					"devAddr":   record.ValueByKey("devAddr"),
 					"deviceType": record.ValueByKey("deviceType"),
-					"name":       record.ValueByKey("name"),
+					"devEUI":       record.ValueByKey("devEUI"),
 					"value":    make(map[string]interface{}),
 				}
 			}
@@ -120,10 +120,10 @@ func main() {
 	})
 
 	// ISSO PEGA DO CACHE (REDIS)
-	app.Get("/api/sensors/latest/:userID/:deviceId", func(c *fiber.Ctx) error {
-		userID := c.Params("userID")
-		deviceId := c.Params("deviceId")
-		cacheKey := fmt.Sprintf("userId:%s:deviceId:%s:history", userID, deviceId)
+	app.Get("/api/sensors/latest/:applicationId/:devEUI", func(c *fiber.Ctx) error {
+		applicationId := c.Params("applicationId")
+		devEUI := c.Params("devEUI")
+		cacheKey := fmt.Sprintf("applicationId:%s:devEUI:%s:history", applicationId, devEUI)
 
 		// Pega todos os itens da lista (do 0 ao -1 significa "tudo")
 		vals, err := rdb.LRange(c.Context(), cacheKey, 0, -1).Result()
@@ -137,12 +137,12 @@ func main() {
 	})
 
 
-	app.Get("/api/sensors/all/:userID", func(c *fiber.Ctx) error {
-		userID := c.Params("userID")
+	app.Get("/api/sensors/all/:applicationId", func(c *fiber.Ctx) error {
+		applicationId := c.Params("applicationId")
 		
 		// 1. Padrão de busca para encontrar as listas de todos os dispositivos do usuário
-		// O Cache-Service agora salva como: userId:fazenda1:deviceId:XYZ:history
-		pattern := fmt.Sprintf("userId:%s:deviceId:*:history", userID)
+		// O Cache-Service agora salva como: applicationId:fazenda1:devEUI:XYZ:history
+		pattern := fmt.Sprintf("applicationId:%s:devEUI:*:history", applicationId)
 
 		// 2. Localiza todas as chaves (dispositivos) que o usuário possui no cache
 		keys, err := rdb.Keys(c.Context(), pattern).Result()
@@ -168,7 +168,7 @@ func main() {
 		}
 
 		return c.JSON(fiber.Map{
-			"usuario": userID,
+			"applicationId": applicationId,
 			"total_dispositivos": len(statusGeral),
 			"leituras": statusGeral,
 		})
