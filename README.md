@@ -14,17 +14,17 @@ O uso de uma API desacoplada garante que o sistema de visualização possa evolu
 
 ### Endpoints Principais
 
-1. **GET `/api/sensors/influx/:applicationId/:days/:devEUI`**
-   - **Fonte**: InfluxDB Cloud (:applicationId).
+1. **GET `/api/sensors/influx/:userId/:days/:devEUI`**
+   - **Fonte**: InfluxDB Cloud (:userId).
    - **Escopo**: Dados históricos do sensor(:devEUI) dos últimos dias (:days).
    - **Objetivo**: Análise de tendências e suporte à decisão de longo prazo.
 
-2. **GET `/api/sensors/latest/:applicationId/:devEUI`**
-   - **Fonte**: REDIS cache (`applicationId:%s:devEUI:%s:history`).
+2. **GET `/api/sensors/latest/:userId/:devEUI`**
+   - **Fonte**: REDIS cache (`userId:%s:devEUI:%s:history`).
    - **Escopo**: Últimas 20 mensagens trafegadas no cache.
    - **Objetivo**: Visualização de status imediato e depuração de conectividade em campo.
 
-3. **GET `/api/sensors/all/:applicationId`**
-   - **Fonte**: REDIS cache (`applicationId:%s:devEUI:*:history`).
+3. **GET `/api/sensors/all/:userId`**
+   - **Fonte**: REDIS cache (`userId:%s:devEUI:*:history`).
    - **Escopo**: Última mensagen de cada um dos sensores do usuario trafegadas no cache.
    - **Objetivo**: Visualização de status imediato e depuração de conectividade em campo.

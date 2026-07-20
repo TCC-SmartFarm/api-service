@@ -17,6 +17,7 @@ import (
 )
 
 type SensorMessage struct { // para o payload do RabbitMQ
+	UserId	string      `json:"userId"`
 	ApplicationId     string      `json:"applicationId"`
 	DeviceType string      `json:"deviceType"`
 	DevAddr   string      `json:"devAddr"`
@@ -65,8 +66,8 @@ func main() {
 
 
 	// 1. GET Histórico (InfluxDB)
-	app.Get("/api/sensors/influx/:applicationId/:days/:devAddr", func(c *fiber.Ctx) error {
-		applicationId := c.Params("applicationId")
+	app.Get("/api/sensors/influx/:userId/:days/:devAddr", func(c *fiber.Ctx) error {
+		userId := c.Params("userId")
 		days := c.Params("days")
 		devAddr := c.Params("devAddr")
 
@@ -74,10 +75,10 @@ func main() {
 		query := fmt.Sprintf(`from(bucket: "%s")
         |> range(start: -%sd)
         |> filter(fn: (r) => r["_measurement"] == "telemetria")
-        |> filter(fn: (r) => r["applicationId"] == "%s")
+        |> filter(fn: (r) => r["userId"] == "%s")
         |> filter(fn: (r) => r["devAddr"] == "%s")
         |> filter(fn: (r) => r["_field"] == "soil_temperature" or r["_field"] == "soil_moisture" or r["_field"] == "air_humidity" or r["_field"] == "luminosity" or r["_field"] == "air_temperature" or r["_field"] == "battery" or r["_field"] == "latitude" or r["_field"] == "longitude" or r["_field"] == "validity")
-        |> map(fn: (r) => ({ r with _value: float(v: r._value) }))`, bucket, days, applicationId, devAddr)
+        |> map(fn: (r) => ({ r with _value: float(v: r._value) }))`, bucket, days, userId, devAddr)
 
 		result, err := queryAPI.Query(context.Background(), query)
 		if err != nil {
@@ -96,6 +97,7 @@ func main() {
 			// Se ainda não iniciamos esse timestamp no mapa, criamos a estrutura base
 			if _, ok := groupedData[t]; !ok {
 				groupedData[t] = fiber.Map{
+					"userId":    record.ValueByKey("userId"),
 					"timestamp":  record.Time().Unix(), // Exibe o timestamp como inteiro (Unix) para facilitar o uso no frontend
 					"applicationId":     record.ValueByKey("applicationId"),
 					"devAddr":   record.ValueByKey("devAddr"),
@@ -120,10 +122,10 @@ func main() {
 	})
 
 	// ISSO PEGA DO CACHE (REDIS)
-	app.Get("/api/sensors/latest/:applicationId/:devEUI", func(c *fiber.Ctx) error {
-		applicationId := c.Params("applicationId")
+	app.Get("/api/sensors/latest/:userId/:devEUI", func(c *fiber.Ctx) error {
+		userId := c.Params("userId")
 		devEUI := c.Params("devEUI")
-		cacheKey := fmt.Sprintf("applicationId:%s:devEUI:%s:history", applicationId, devEUI)
+		cacheKey := fmt.Sprintf("userId:%s:devEUI:%s:history", userId, devEUI)
 
 		// Pega todos os itens da lista (do 0 ao -1 significa "tudo")
 		vals, err := rdb.LRange(c.Context(), cacheKey, 0, -1).Result()
@@ -136,13 +138,12 @@ func main() {
 		return c.SendString("[" + strings.Join(vals, ",") + "]")
 	})
 
+	app.Get("/api/sensors/all/:userId", func(c *fiber.Ctx) error {
+		userId := c.Params("userId")
 
-	app.Get("/api/sensors/all/:applicationId", func(c *fiber.Ctx) error {
-		applicationId := c.Params("applicationId")
-		
 		// 1. Padrão de busca para encontrar as listas de todos os dispositivos do usuário
-		// O Cache-Service agora salva como: applicationId:fazenda1:devEUI:XYZ:history
-		pattern := fmt.Sprintf("applicationId:%s:devEUI:*:history", applicationId)
+		// O Cache-Service agora salva como: userId:XYZ:devEUI:XYZ:history
+		pattern := fmt.Sprintf("userId:%s:devEUI:*:history", userId)
 
 		// 2. Localiza todas as chaves (dispositivos) que o usuário possui no cache
 		keys, err := rdb.Keys(c.Context(), pattern).Result()
@@ -168,7 +169,7 @@ func main() {
 		}
 
 		return c.JSON(fiber.Map{
-			"applicationId": applicationId,
+			"userId":          userId,
 			"total_dispositivos": len(statusGeral),
 			"leituras": statusGeral,
 		})
