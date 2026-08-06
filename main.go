@@ -15,7 +15,6 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/influxdata/influxdb-client-go/v2"
-	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -24,11 +23,12 @@ import (
 var deviceIdPattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
 type SensorMessage struct { // para o payload do RabbitMQ
-	UserId     string      `json:"userId"`
-	DeviceType string      `json:"deviceType"`
-	DeviceId   string      `json:"deviceId"`
-	Name       string      `json:"name"`
-	Payload    interface{} `json:"payload"` // interface{} permite receber qualquer JSON interno
+	UserId        string      `json:"userId"`
+	ApplicationId string      `json:"applicationId"`
+	DeviceType    string      `json:"deviceType"`
+	DevAddr       string      `json:"devAddr"`
+	DevEUI        string      `json:"devEUI"`
+	Payload       interface{} `json:"payload"` // interface{} permite receber qualquer JSON interno
 }
 
 func main() {
@@ -37,7 +37,6 @@ func main() {
 	token := os.Getenv("INFLUX_TOKEN")
 	org := os.Getenv("INFLUX_ORG")
 	bucket := os.Getenv("INFLUX_BUCKET")
-	rabbitURL := os.Getenv("RABBIT_URL")
 	redisAddr := os.Getenv("REDIS_ADDR")
 	authDomain := os.Getenv("AUTH_DOMAIN")
 	authAudience := os.Getenv("AUTH_AUDIENCE")
@@ -51,20 +50,15 @@ func main() {
 	queryAPI := client.QueryAPI(org)
 	defer client.Close()
 
-	// Conector RabbitMQ
-	rabbitConn, err := amqp.Dial(rabbitURL)
-	if err != nil {
-		log.Fatal("Erro ao conectar no RabbitMQ:", err)
-	}
-	defer rabbitConn.Close()
-
-	// Conector Redis
+	// Conector Redis. Exige senha porque o Redis passou a escutar no IP privado da
+	// VM (para ser alcançável pelo Container Apps), e não só na rede do compose.
 	rdb := redis.NewClient(&redis.Options{
-		Addr: redisAddr,
+		Addr:     redisAddr,
+		Password: os.Getenv("REDIS_PASSWORD"),
 	})
 
 	// Testa conexão
-	_, err = rdb.Ping(context.Background()).Result()
+	_, err := rdb.Ping(context.Background()).Result()
 
 	if err != nil {
 		log.Fatal("Erro ao conectar no Redis:", err)
@@ -107,16 +101,18 @@ func main() {
 	app.Use(authMiddleware(jwks, authAudience, authDomain))
 
 	// 1. GET Histórico (InfluxDB)
-	app.Get("/api/sensors/influx/:days/:deviceId", func(c *fiber.Ctx) error {
+	// O userId NÃO vem da URL: sai da claim do JWT validado pelo authMiddleware.
+	// Assim um usuário não consegue ler os sensores de outro trocando o parâmetro.
+	app.Get("/api/sensors/influx/:days/:devAddr", func(c *fiber.Ctx) error {
 		user := GetAuthUser(c)
 		days := c.Params("days")
-		deviceId := c.Params("deviceId")
+		devAddr := c.Params("devAddr")
 
 		if _, err := strconv.Atoi(days); err != nil {
 			return c.Status(400).JSON(fiber.Map{"error": "days deve ser um número inteiro"})
 		}
-		if !deviceIdPattern.MatchString(deviceId) {
-			return c.Status(400).JSON(fiber.Map{"error": "deviceId inválido"})
+		if !deviceIdPattern.MatchString(devAddr) {
+			return c.Status(400).JSON(fiber.Map{"error": "devAddr inválido"})
 		}
 
 		// Query corrigida: converte para float para evitar erro de agregação com strings
@@ -124,9 +120,9 @@ func main() {
         |> range(start: -%sd)
         |> filter(fn: (r) => r["_measurement"] == "telemetria")
         |> filter(fn: (r) => r["userId"] == "%s")
-        |> filter(fn: (r) => r["deviceId"] == "%s")
-        |> filter(fn: (r) => r["_field"] == "soil_temperature" or r["_field"] == "soil_moisture" or r["_field"] == "air_humidity" or r["_field"] == "luminosity" or r["_field"] == "air_temperature" or r["_field"] == "battery" or r["_field"] == "latitude" or r["_field"] == "longitude")
-        |> map(fn: (r) => ({ r with _value: float(v: r._value) }))`, bucket, days, user.UserID, deviceId)
+        |> filter(fn: (r) => r["devAddr"] == "%s")
+        |> filter(fn: (r) => r["_field"] == "soil_temperature" or r["_field"] == "soil_moisture" or r["_field"] == "air_humidity" or r["_field"] == "luminosity" or r["_field"] == "air_temperature" or r["_field"] == "battery" or r["_field"] == "latitude" or r["_field"] == "longitude" or r["_field"] == "validity")
+        |> map(fn: (r) => ({ r with _value: float(v: r._value) }))`, bucket, days, user.UserID, devAddr)
 
 		result, err := queryAPI.Query(context.Background(), query)
 		if err != nil {
@@ -145,12 +141,13 @@ func main() {
 			// Se ainda não iniciamos esse timestamp no mapa, criamos a estrutura base
 			if _, ok := groupedData[t]; !ok {
 				groupedData[t] = fiber.Map{
-					"timestamp":  record.Time().Unix(), // Exibe o timestamp como inteiro (Unix) para facilitar o uso no frontend
-					"userId":     record.ValueByKey("userId"),
-					"deviceId":   record.ValueByKey("deviceId"),
-					"deviceType": record.ValueByKey("deviceType"),
-					"name":       record.ValueByKey("name"),
-					"value":      make(map[string]interface{}),
+					"userId":        record.ValueByKey("userId"),
+					"timestamp":     record.Time().Unix(), // Exibe o timestamp como inteiro (Unix) para facilitar o uso no frontend
+					"applicationId": record.ValueByKey("applicationId"),
+					"devAddr":       record.ValueByKey("devAddr"),
+					"deviceType":    record.ValueByKey("deviceType"),
+					"devEUI":        record.ValueByKey("devEUI"),
+					"value":         make(map[string]interface{}),
 				}
 			}
 
@@ -169,15 +166,15 @@ func main() {
 	})
 
 	// ISSO PEGA DO CACHE (REDIS)
-	app.Get("/api/sensors/latest/:deviceId", func(c *fiber.Ctx) error {
+	app.Get("/api/sensors/latest/:devEUI", func(c *fiber.Ctx) error {
 		user := GetAuthUser(c)
-		deviceId := c.Params("deviceId")
+		devEUI := c.Params("devEUI")
 
-		if !deviceIdPattern.MatchString(deviceId) {
-			return c.Status(400).JSON(fiber.Map{"error": "deviceId inválido"})
+		if !deviceIdPattern.MatchString(devEUI) {
+			return c.Status(400).JSON(fiber.Map{"error": "devEUI inválido"})
 		}
 
-		cacheKey := fmt.Sprintf("userId:%s:deviceId:%s:history", user.UserID, deviceId)
+		cacheKey := fmt.Sprintf("userId:%s:devEUI:%s:history", user.UserID, devEUI)
 
 		// Pega todos os itens da lista (do 0 ao -1 significa "tudo")
 		vals, err := rdb.LRange(c.Context(), cacheKey, 0, -1).Result()
@@ -194,8 +191,8 @@ func main() {
 		user := GetAuthUser(c)
 
 		// 1. Padrão de busca para encontrar as listas de todos os dispositivos do usuário
-		// O Cache-Service agora salva como: userId:fazenda1:deviceId:XYZ:history
-		pattern := fmt.Sprintf("userId:%s:deviceId:*:history", user.UserID)
+		// O Cache-Service salva como: userId:fazenda1:devEUI:XYZ:history
+		pattern := fmt.Sprintf("userId:%s:devEUI:*:history", user.UserID)
 
 		// 2. Localiza todas as chaves (dispositivos) que o usuário possui no cache
 		keys, err := rdb.Keys(c.Context(), pattern).Result()
@@ -221,7 +218,10 @@ func main() {
 		}
 
 		return c.JSON(fiber.Map{
+			// "usuario" é o nome que o front já consome (fetch-sensors-latest.ts).
+			// "userId" vai junto para alinhar com a nomenclatura do develop.
 			"usuario":            user.UserID,
+			"userId":             user.UserID,
 			"total_dispositivos": len(statusGeral),
 			"leituras":           statusGeral,
 		})
