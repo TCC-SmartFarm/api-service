@@ -64,6 +64,19 @@ func main() {
 		log.Fatal("Erro ao conectar no Redis:", err)
 	}
 
+	// Cadastro de sensores (Supabase) — mesma tabela que o mqtt-sub consulta na
+	// ingestão. Opcional: sem credenciais a API sobe do mesmo jeito e as rotas
+	// que dependem do cadastro respondem 503.
+	supa, err := newSupabaseClient()
+	if err != nil {
+		log.Fatal("Erro ao inicializar o cliente do Supabase:", err)
+	}
+	if supa == nil {
+		log.Println("AVISO: SUPABASE_URL/SUPABASE_KEY ausentes — cadastro de sensores desabilitado")
+	} else {
+		log.Println("Cadastro de sensores (Supabase) habilitado")
+	}
+
 	// Chaves públicas do Auth0 para validar os JWTs. Retry no boot porque o
 	// container pode subir antes da rede/DNS estarem prontos.
 	var jwks keyfunc.Keyfunc
@@ -99,6 +112,30 @@ func main() {
 	// Todas as rotas registradas a partir daqui exigem JWT válido do Auth0.
 	// Nos handlers, use GetAuthUser(c) para obter o usuário autenticado.
 	app.Use(authMiddleware(jwks, authAudience, authDomain))
+
+	// Cadastro: quais sensores pertencem ao usuário autenticado.
+	// O front usa isto para montar a lista sem depender de haver leitura no
+	// cache — um sensor recém-cadastrado, que ainda não publicou nada, aparece.
+	app.Get("/api/sensors/devices", func(c *fiber.Ctx) error {
+		user := GetAuthUser(c)
+
+		if supa == nil {
+			return c.Status(503).JSON(fiber.Map{
+				"error": "cadastro de sensores indisponível: Supabase não configurado",
+			})
+		}
+
+		devices, err := fetchDevicesForUser(supa, user.UserID)
+		if err != nil {
+			return c.Status(502).JSON(fiber.Map{"error": err.Error()})
+		}
+
+		return c.JSON(fiber.Map{
+			"usuario": user.UserID,
+			"total":   len(devices),
+			"devices": devices,
+		})
+	})
 
 	// 1. GET Histórico (InfluxDB)
 	// O userId NÃO vem da URL: sai da claim do JWT validado pelo authMiddleware.
@@ -190,29 +227,58 @@ func main() {
 	app.Get("/api/sensors/all", func(c *fiber.Ctx) error {
 		user := GetAuthUser(c)
 
-		// 1. Padrão de busca para encontrar as listas de todos os dispositivos do usuário
-		// O Cache-Service salva como: userId:fazenda1:devEUI:XYZ:history
-		pattern := fmt.Sprintf("userId:%s:devEUI:*:history", user.UserID)
+		// 1. As chaves saem do cadastro no Supabase quando ele está disponível.
+		// Assim não é preciso varrer o keyspace do Redis — que é compartilhado
+		// por todas as fazendas — a cada requisição de um único usuário.
+		var keys []string
+		if supa != nil {
+			devices, err := fetchDevicesForUser(supa, user.UserID)
+			if err != nil {
+				log.Printf("cadastro indisponível (%v); usando varredura do cache", err)
+			}
+			for _, d := range devices {
+				keys = append(keys, fmt.Sprintf("userId:%s:devEUI:%s:history", user.UserID, d.DevEUI))
+			}
+		}
 
-		// 2. Localiza todas as chaves (dispositivos) que o usuário possui no cache
-		keys, err := rdb.Keys(c.Context(), pattern).Result()
-		if err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": "Erro ao escanear dispositivos"})
+		// 2. Sem cadastro (ou cadastro vazio): varre o cache com SCAN, que
+		// devolve o controle entre os lotes. Nunca KEYS, que bloqueia o Redis
+		// durante a varredura inteira.
+		if len(keys) == 0 {
+			pattern := fmt.Sprintf("userId:%s:devEUI:*:history", user.UserID)
+			iter := rdb.Scan(c.Context(), 0, pattern, 100).Iterator()
+			for iter.Next(c.Context()) {
+				keys = append(keys, iter.Val())
+			}
+			if err := iter.Err(); err != nil {
+				return c.Status(500).JSON(fiber.Map{"error": "Erro ao escanear dispositivos"})
+			}
 		}
 
 		if len(keys) == 0 {
 			return c.Status(404).JSON(fiber.Map{"message": "Nenhum sensor ativo encontrado"})
 		}
 
-		var statusGeral []interface{}
+		// 3. Última leitura de cada dispositivo num único round-trip, em vez de
+		// um LINDEX sequencial por sensor.
+		pipe := rdb.Pipeline()
+		cmds := make([]*redis.StringCmd, len(keys))
+		for i, key := range keys {
+			cmds[i] = pipe.LIndex(c.Context(), key, 0)
+		}
+		if _, err := pipe.Exec(c.Context()); err != nil && err != redis.Nil {
+			return c.Status(500).JSON(fiber.Map{"error": "Erro ao ler o cache"})
+		}
 
-		// 3. Para cada chave encontrada, pegamos apenas o PRIMEIRO item (índice 0)
-		// O LIndex(ctx, chave, 0) pega a leitura mais recente do buffer de 20
-		for _, key := range keys {
-			val, err := rdb.LIndex(c.Context(), key, 0).Result()
-			if err == nil {
-				var lastRead interface{}
-				json.Unmarshal([]byte(val), &lastRead)
+		var statusGeral []interface{}
+		for _, cmd := range cmds {
+			val, err := cmd.Result()
+			if err != nil {
+				// Sensor cadastrado que ainda não publicou nada: sem leitura no cache.
+				continue
+			}
+			var lastRead interface{}
+			if json.Unmarshal([]byte(val), &lastRead) == nil {
 				statusGeral = append(statusGeral, lastRead)
 			}
 		}
