@@ -152,14 +152,19 @@ func main() {
 			return c.Status(400).JSON(fiber.Map{"error": "devAddr inválido"})
 		}
 
-		// Query corrigida: converte para float para evitar erro de agregação com strings
+		// O identificador do dispositivo aparece com dois nomes de tag no bucket:
+		// `devAddr`, gravado pelo connector do fluxo LoRa, e `deviceId`, gravado
+		// pelo fluxo do broker próprio. Filtrar só por um esconde metade do
+		// histórico, então a query aceita os dois.
+		//
+		// Converte para float para evitar erro de agregação com strings.
 		query := fmt.Sprintf(`from(bucket: "%s")
         |> range(start: -%sd)
         |> filter(fn: (r) => r["_measurement"] == "telemetria")
         |> filter(fn: (r) => r["userId"] == "%s")
-        |> filter(fn: (r) => r["devAddr"] == "%s")
+        |> filter(fn: (r) => r["devAddr"] == "%s" or r["deviceId"] == "%s")
         |> filter(fn: (r) => r["_field"] == "soil_temperature" or r["_field"] == "soil_moisture" or r["_field"] == "air_humidity" or r["_field"] == "luminosity" or r["_field"] == "air_temperature" or r["_field"] == "battery" or r["_field"] == "latitude" or r["_field"] == "longitude" or r["_field"] == "validity")
-        |> map(fn: (r) => ({ r with _value: float(v: r._value) }))`, bucket, days, user.UserID, devAddr)
+        |> map(fn: (r) => ({ r with _value: float(v: r._value) }))`, bucket, days, user.UserID, devAddr, devAddr)
 
 		result, err := queryAPI.Query(context.Background(), query)
 		if err != nil {
@@ -177,13 +182,25 @@ func main() {
 
 			// Se ainda não iniciamos esse timestamp no mapa, criamos a estrutura base
 			if _, ok := groupedData[t]; !ok {
+				// Pontos do fluxo do broker próprio só têm a tag `deviceId`;
+				// sem este fallback o front recebe devAddr/devEUI vazios.
+				deviceID := record.ValueByKey("deviceId")
+				devAddrOut := record.ValueByKey("devAddr")
+				if devAddrOut == nil || devAddrOut == "" {
+					devAddrOut = deviceID
+				}
+				devEUIOut := record.ValueByKey("devEUI")
+				if devEUIOut == nil || devEUIOut == "" {
+					devEUIOut = deviceID
+				}
+
 				groupedData[t] = fiber.Map{
 					"userId":        record.ValueByKey("userId"),
 					"timestamp":     record.Time().Unix(), // Exibe o timestamp como inteiro (Unix) para facilitar o uso no frontend
 					"applicationId": record.ValueByKey("applicationId"),
-					"devAddr":       record.ValueByKey("devAddr"),
+					"devAddr":       devAddrOut,
 					"deviceType":    record.ValueByKey("deviceType"),
-					"devEUI":        record.ValueByKey("devEUI"),
+					"devEUI":        devEUIOut,
 					"value":         make(map[string]interface{}),
 				}
 			}
