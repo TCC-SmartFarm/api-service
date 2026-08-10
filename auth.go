@@ -63,13 +63,17 @@ func authMiddleware(jwks keyfunc.Keyfunc, audience, domain string) fiber.Handler
 			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "token inválido ou expirado"})
 		}
 
-		if claims.UserID == "" {
-			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "usuário sem fazenda associada"})
+		// A identidade do usuário é o `sub` do Auth0, não uma claim customizada.
+		// O `sub` está sempre no access token, sem depender de app_metadata nem
+		// de Action de post-login — que é onde a claim antiga se perdia: a Action
+		// a escrevia só no ID token, então o front a enxergava e a API não.
+		if claims.Subject == "" {
+			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "token sem identificador de usuário"})
 		}
 
 		c.Locals(localsAuthUser, AuthUser{
 			Sub:    claims.Subject,
-			UserID: claims.UserID,
+			UserID: claims.Subject,
 			Email:  claims.Email,
 			Name:   claims.Name,
 		})
