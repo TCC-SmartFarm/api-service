@@ -125,7 +125,7 @@ func main() {
 			})
 		}
 
-		devices, err := fetchDevicesForUser(supa, user.UserID)
+		devices, err := devicesForUserEnsuringRow(supa, user.UserID)
 		if err != nil {
 			return c.Status(502).JSON(fiber.Map{"error": err.Error()})
 		}
@@ -249,7 +249,7 @@ func main() {
 		// por todas as fazendas — a cada requisição de um único usuário.
 		var keys []string
 		if supa != nil {
-			devices, err := fetchDevicesForUser(supa, user.UserID)
+			devices, err := devicesForUserEnsuringRow(supa, user.UserID)
 			if err != nil {
 				log.Printf("cadastro indisponível (%v); usando varredura do cache", err)
 			}
