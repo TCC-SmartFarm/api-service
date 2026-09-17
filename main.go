@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"encoding/json" 
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -74,7 +75,7 @@ func main() {
 
 	// 1. GET Histórico (InfluxDB)
 	app.Get("/api/sensors/influx/:userId/:days/:devEUI", func(c *fiber.Ctx) error {
-		userId := c.Params("userId")
+		userId, _ := url.PathUnescape(c.Params("userId"))
 		days := c.Params("days")
 		devEUI := c.Params("devEUI")
 
@@ -130,7 +131,7 @@ func main() {
 
 	// ISSO PEGA DO CACHE (REDIS)
 	app.Get("/api/sensors/latest/:userId/:devEUI", func(c *fiber.Ctx) error {
-		userId := c.Params("userId")
+		userId, _ := url.PathUnescape(c.Params("userId"))
 		devEUI := c.Params("devEUI")
 		cacheKey := fmt.Sprintf("userId:%s:devEUI:%s:history", userId, devEUI)
 
@@ -205,7 +206,7 @@ func main() {
 	})
 
 	app.Get("/api/sensors/all/:userId", func(c *fiber.Ctx) error {
-		userId := c.Params("userId")
+		userId, _ := url.PathUnescape(c.Params("userId"))
 
 		// 1. Padrão de busca para encontrar as listas de todos os dispositivos do usuário
 		// O Cache-Service agora salva como: userId:XYZ:devEUI:XYZ:history
