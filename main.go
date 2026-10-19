@@ -84,13 +84,13 @@ func main() {
         |> range(start: -%sd)
         |> filter(fn: (r) => r["_measurement"] == "telemetria")
         |> filter(fn: (r) => r["userId"] == "%s")
-        |> filter(fn: (r) => r["devEUI"] == "%s")
-        |> filter(fn: (r) => r["_field"] == "soil_temperature" or r["_field"] == "soil_moisture" or r["_field"] == "air_humidity" or r["_field"] == "luminosity" or r["_field"] == "air_temperature" or r["_field"] == "battery" or r["_field"] == "latitude" or r["_field"] == "longitude" or r["_field"] == "validity")
-        |> map(fn: (r) => ({ r with _value: float(v: r._value) }))`, bucket, days, userId, devEUI)
-
+        |> filter(fn: (r) => r["devEUI"] == "%s")`, bucket, days, userId, devEUI)
+        // |> filter(fn: (r) => r["_field"] == "soil_temperature" or r["_field"] == "soil_moisture" or r["_field"] == "air_humidity" or r["_field"] == "luminosity" or r["_field"] == "air_temperature" or r["_field"] == "battery" or r["_field"] == "latitude" or r["_field"] == "longitude" or r["_field"] == "validity")
+		
 		result, err := queryAPI.Query(context.Background(), query)
 		if err != nil {
 			// Retorna o erro real vindo do SDK para facilitar o debug
+			log.Printf("ERRO na consulta Flux: %v", err)
 			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
 		}
 
