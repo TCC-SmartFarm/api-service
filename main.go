@@ -324,5 +324,15 @@ func main() {
 		})
 	})
 
+	// ISSO DAQUI É O ENDPOINT QUE PEGA AS INFORMAÇÕES DO MSS DE IRRIGAÇÃO
+	// Endpoint público consumido pelo aplicativo. O API Service encaminha a
+	// consulta ao MSS usando a URL interna definida por IRRIGATION_MSS_URL.
+	app.Get("/api/v1/irrigation", irrigationProxyHandler(os.Getenv("IRRIGATION_MSS_URL")))
+	if strings.TrimSpace(os.Getenv("IRRIGATION_MSS_URL")) == "" {
+		log.Println("AVISO: IRRIGATION_MSS_URL não configurada; /api/v1/irrigation responderá HTTP 503")
+	}
+	
+	
+
 	log.Fatal(app.Listen(":3000"))
 }
