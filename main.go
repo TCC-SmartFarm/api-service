@@ -202,7 +202,7 @@ func main() {
 		}
 
 		// Inverte a array para enviar a mais recente primeiro para o Front-end
-		return c.JSON(reverseArray(records))
+		return c.JSON(records)
 	})
 
 	app.Get("/api/sensors/all/:userId", func(c *fiber.Ctx) error {
